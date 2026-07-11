@@ -1065,6 +1065,26 @@ if (state.onboarded) onboardEl.classList.add("hide");
 resize();
 computeSky(Date.now());
 frame();
+// 別アプリから復帰したとき（B-008）: iOSはバックグラウンドで相対フレームが
+// リセットされることがあり、凍結した北合わせのままだと全然違う方角に固定される。
+// 校正を破棄して最初の読み値からやり直す（水平寄りに向ければ即再校正される）
+function resetSensorCalibration() {
+  if (!sensor.active) return;
+  sensor.headingOffset = null;
+  sensor._lastAzBackRel = null;
+  sensor.targetVec = null; // 復帰後の最初の読み値まで古い向きを使わない
+  state.fVec = null;       // 最初の読み値へ即スナップ（横断アニメしない）
+  // iOSは復帰後にイベント配信が止まることがあるためリスナーを付け直す
+  if (sensor._handler) {
+    const ev = "ondeviceorientationabsolute" in window ? "deviceorientationabsolute" : "deviceorientation";
+    window.removeEventListener(ev, sensor._handler);
+    window.addEventListener(ev, sensor._handler);
+  }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resetSensorCalibration();
+});
+window.addEventListener("pageshow", e => { if (e.persisted) resetSensorCalibration(); });
 // 前回センサーモードだった場合の復元。iOSは許可にユーザー操作が必要なので案内だけ出す
 if (state.onboarded && state.wasSensorMode) {
   if (typeof DeviceOrientationEvent !== "undefined" &&
