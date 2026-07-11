@@ -354,6 +354,7 @@ const sensor = {
   },
   _onEvent(e) {
     let alpha = e.alpha, beta = e.beta, gamma = e.gamma;
+    this.lastRaw = { alpha, beta, gamma, heading: e.webkitCompassHeading, absolute: e.absolute, type: e.type };
     if (alpha == null || beta == null || gamma == null) return;
     if (typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading)) {
       // iOS: alphaは相対値なのでコンパス方位で置き換える（近似）
@@ -398,17 +399,16 @@ const sensor = {
       toast("センサーを開始できませんでした。手動モードで表示します");
       return false;
     }
-    const handler = this._onEvent.bind(this);
-    if ("ondeviceorientationabsolute" in window) {
-      this.expectAbsolute = true;
-      window.addEventListener("deviceorientationabsolute", handler);
-    } else {
-      this.expectAbsolute = false;
-      window.addEventListener("deviceorientation", handler);
-    }
+    // 再試行時にリスナーが重複しないよう、登録済みのものを外してから付け直す
+    if (!this._handler) this._handler = this._onEvent.bind(this);
+    const eventName = "ondeviceorientationabsolute" in window ? "deviceorientationabsolute" : "deviceorientation";
+    this.expectAbsolute = eventName === "deviceorientationabsolute";
+    window.removeEventListener(eventName, this._handler);
+    window.addEventListener(eventName, this._handler);
     // 1.2秒待って読み値が来なければセンサー無しと判断
     await new Promise(res => setTimeout(res, 1200));
     if (!this.hasReading) {
+      window.removeEventListener(eventName, this._handler);
       toast("方位センサーが見つかりません。手動モードで表示します");
       return false;
     }
@@ -638,6 +638,14 @@ function frame() {
 // ---- HUD ----
 const clockEl = document.getElementById("clock");
 const gazeEl = document.getElementById("gaze");
+// ?debug でセンサー生値のオーバーレイを表示（実機検証用）
+let debugEl = null;
+if (new URLSearchParams(location.search).has("debug")) {
+  debugEl = document.createElement("div");
+  debugEl.style.cssText = "position:fixed;left:8px;bottom:48px;z-index:40;font:11px/1.5 monospace;" +
+    "color:#8f8;background:#000a;padding:6px 8px;border-radius:6px;pointer-events:none;white-space:pre";
+  document.body.appendChild(debugEl);
+}
 let lastHud = 0;
 function updateHud(now) {
   if (now - lastHud < 250) return;
@@ -646,6 +654,16 @@ function updateHud(now) {
   clockEl.textContent = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   const dir = DIRS8[Math.round(((state.az % 360) + 360) % 360 / 45) % 8];
   gazeEl.textContent = `${dir} ${Math.round(state.az)}° ／ 高度 ${Math.round(state.alt)}°`;
+  if (debugEl) {
+    const r = sensor.lastRaw, t = sensor.target;
+    const f1 = x => (typeof x === "number" ? x.toFixed(1) : String(x));
+    debugEl.textContent =
+      `mode:${state.mode} active:${sensor.active}\n` +
+      (r ? `ev:${r.type} abs:${r.absolute}\nα:${f1(r.alpha)} β:${f1(r.beta)} γ:${f1(r.gamma)} hd:${f1(r.heading)}\n` : "ev:none\n") +
+      (t ? `target az:${f1(t.az)} alt:${f1(t.alt)} roll:${f1(t.roll)}\n` : "") +
+      `view az:${f1(state.az)} alt:${f1(state.alt)} roll:${f1(state.roll)}\n` +
+      `scr:${(screen.orientation && screen.orientation.angle) || 0}°`;
+  }
 }
 
 // ---- タップ判定 ----
@@ -901,10 +919,12 @@ const onboardEl = document.getElementById("onboard");
 document.getElementById("startSensor").addEventListener("click", async () => {
   onboardEl.classList.add("hide");
   state.onboarded = true;
-  requestGeo();
+  // iOSのrequestPermission()は「ユーザー操作の直中」でしか許可ダイアログを出せない。
+  // 先に位置情報プロンプトを挟むと操作権が消費されて無言で失敗するため、センサーを先に
   const ok = await sensor.start();
   state.mode = ok ? "sensor" : "drag";
   applyMode();
+  requestGeo();
   saveSettings();
 });
 document.getElementById("startDrag").addEventListener("click", () => {
