@@ -86,6 +86,35 @@ for (const [caseName, c] of Object.entries(REF)) {
     `got ${rolled}`);
 }
 
+// 2.5) cameraFromVectors: 基本性質と天頂付近の連続性（B-003回帰テスト）
+{
+  const focal = projection.focalLength(70, 800);
+  // 基本: 北を向いて上=天頂なら、右=東
+  const cam = projection.cameraFromVectors([0, 1, 0], [0, 0, 1]);
+  check("camVec right=east", Math.abs(cam.r[0] - 1) < 1e-9 && Math.abs(cam.r[1]) < 1e-9,
+    `got r=${cam.r}`);
+  // makeCameraと同じ視線なら同じ投影結果になる
+  const star = astro.altAzToVec(40, 130);
+  const pA = projection.project(projection.makeCamera(120, 30, 0), star, focal, 400, 400);
+  const pB = projection.project(projection.cameraFromVectors(astro.altAzToVec(30, 120), [0, 0, 1]), star, focal, 400, 400);
+  check("camVec matches makeCamera", pA && pB && Math.hypot(pA[0] - pB[0], pA[1] - pB[1]) < 1e-6,
+    `got ${pA} vs ${pB}`);
+  // 天頂付近の連続性: 天頂越しに1°違うだけの2視線（az 0/180）で星の投影が飛ばない。
+  // 旧実装（az/alt/roll経由）ではここで画面が反転し「上を向くと一気に横へずれる」が起きた
+  const up = [0, 1, 0]; // 画面上方向（ほぼ水平＝スマホを頭上へかざした姿勢）
+  const p1 = projection.project(projection.cameraFromVectors(astro.altAzToVec(89.5, 0), up), astro.altAzToVec(80, 0), focal, 400, 400);
+  const p2 = projection.project(projection.cameraFromVectors(astro.altAzToVec(89.5, 180), up), astro.altAzToVec(80, 0), focal, 400, 400);
+  const jump = p1 && p2 ? Math.hypot(p1[0] - p2[0], p1[1] - p2[1]) : 1e9;
+  const oneDeg = focal * Math.tan(1 * Math.PI / 180);
+  check("camVec zenith continuity", jump < oneDeg * 1.5,
+    `jump=${jump.toFixed(1)}px (1°=${oneDeg.toFixed(1)}px)`);
+  // 退化ケース: upが視線と平行でもクラッシュせず有効な基底を返す
+  const camD = projection.cameraFromVectors([0, 0, 1], [0, 0, 1]);
+  const len = v => Math.hypot(v[0], v[1], v[2]);
+  check("camVec degenerate up", Math.abs(len(camD.r) - 1) < 1e-6 && Math.abs(len(camD.u) - 1) < 1e-6,
+    `got r=${camD.r} u=${camD.u}`);
+}
+
 // 3) データ整合性（埋め込みデータの健全性）
 {
   const dataSrc = extract("// ==DATA-START==", "// ==DATA-END==");

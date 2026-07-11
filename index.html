@@ -289,6 +289,32 @@ const projection = {
   focalLength(fovDeg, screenH) {
     return (screenH / 2) / Math.tan(fovDeg / 2 * astro.D2R);
   },
+  // 視線ベクトルと画面上方向ベクトルからカメラ基底を直接作る（センサーモード用）。
+  // 角度(az/alt/roll)を経由しないため天頂でも特異点がなく連続
+  cameraFromVectors(fRaw, upRaw) {
+    const norm = v => {
+      const n = Math.hypot(v[0], v[1], v[2]);
+      return n < 1e-9 ? null : [v[0] / n, v[1] / n, v[2] / n];
+    };
+    const f = norm(fRaw);
+    if (!f) return this.makeCamera(0, 0, 0);
+    // upから視線成分を除いて直交化。退化時（up∥視線）は天頂を基準に落とす
+    let u = null;
+    if (upRaw) {
+      const d = upRaw[0] * f[0] + upRaw[1] * f[1] + upRaw[2] * f[2];
+      u = norm([upRaw[0] - d * f[0], upRaw[1] - d * f[1], upRaw[2] - d * f[2]]);
+    }
+    if (!u) {
+      u = norm([-f[2] * f[0], -f[2] * f[1], 1 - f[2] * f[2]]);
+      if (!u) u = [0, 1, 0];
+    }
+    const r = [
+      f[1] * u[2] - f[2] * u[1],
+      f[2] * u[0] - f[0] * u[2],
+      f[0] * u[1] - f[1] * u[0],
+    ];
+    return { f, r, u };
+  },
 };
 // ==ASTRO-END==
 
@@ -307,7 +333,8 @@ const state = {
   showLines: true, showNames: true, showConstNames: true, redMode: false,
   fovDeg: 70,
   mode: "drag",            // "drag" | "sensor"
-  az: 180, alt: 30, roll: 0, // 視線（描画に使う平滑化済みの値）
+  az: 180, alt: 30, roll: 0, // 視線（ドラッグモードの描画とHUD表示に使う）
+  fVec: null, upVec: null,   // センサーモードの視線/画面上ベクトル（平滑化済み）
   selected: null,          // {type:"star",i} | {type:"const",abbr}
   onboarded: false,
 };
@@ -365,9 +392,6 @@ const sensor = {
     const m = this._matrix(alpha, beta, gamma);
     // 端末背面(-z)が向く方向 = ユーザーがかざした方向
     const v = [-m[2], -m[5], -m[8]];
-    const alt = Math.asin(Math.min(1, Math.max(-1, v[2]))) / astro.D2R;
-    let az = Math.atan2(v[0], v[1]) / astro.D2R;
-    if (az < 0) az += 360;
     // 画面の上方向（画面回転を補正して端末座標に直してから地上座標へ）
     const th = ((screen.orientation && screen.orientation.angle) || 0) * astro.D2R;
     const su = [-Math.sin(th), Math.cos(th), 0];
@@ -376,12 +400,10 @@ const sensor = {
       m[3] * su[0] + m[4] * su[1],
       m[6] * su[0] + m[7] * su[1],
     ];
-    const cam = projection.makeCamera(az, alt, 0);
-    const roll = Math.atan2(
-      yE[0] * cam.r[0] + yE[1] * cam.r[1] + yE[2] * cam.r[2],
-      yE[0] * cam.u[0] + yE[1] * cam.u[1] + yE[2] * cam.u[2]
-    ) / astro.D2R;
-    this.target = { az, alt, roll };
+    // 角度(az/alt/roll)には分解しない。天頂付近で方位角が不定になり
+    // 「上を向くと一気に横へずれる」ため、ベクトルのままframe側で平滑化する
+    this.targetVec = v;
+    this.targetUp = yE;
     this.hasReading = true;
   },
   async start() {
@@ -468,7 +490,9 @@ function computeSky(nowMs) {
 
 function draw(nowMs) {
   const pal = state.redMode ? PALETTE.red : PALETTE.normal;
-  const cam = projection.makeCamera(state.az, state.alt, state.roll);
+  const cam = (state.mode === "sensor" && state.fVec)
+    ? projection.cameraFromVectors(state.fVec, state.upVec)
+    : projection.makeCamera(state.az, state.alt, state.roll);
   const focal = projection.focalLength(state.fovDeg, H);
   const cx = W / 2, cy = H / 2;
   const margin = 120;
@@ -619,15 +643,23 @@ function frame() {
   // 恒星時変化は遅いので座標計算は200ms間隔で十分（描画は毎フレーム）
   if (now - lastSkyCompute > 200) { computeSky(now); lastSkyCompute = now; }
 
-  if (state.mode === "sensor" && sensor.target) {
-    // 平滑化（方位の360°またぎに注意）
-    const k = 0.22;
-    const t = sensor.target;
-    let dAz = ((t.az - state.az + 540) % 360) - 180;
-    let dRoll = ((t.roll - state.roll + 540) % 360) - 180;
-    state.az = (state.az + dAz * k + 360) % 360;
-    state.alt += (t.alt - state.alt) * k;
-    state.roll = (state.roll + dRoll * k + 540) % 360 - 180;
+  if (state.mode === "sensor" && sensor.targetVec) {
+    // 平滑化はベクトルのまま行う（角度だと天頂付近で方位が飛ぶ）
+    const k = 0.25;
+    if (!state.fVec) {
+      state.fVec = sensor.targetVec.slice();
+      state.upVec = sensor.targetUp.slice();
+    } else {
+      for (let i = 0; i < 3; i++) {
+        state.fVec[i] += (sensor.targetVec[i] - state.fVec[i]) * k;
+        state.upVec[i] += (sensor.targetUp[i] - state.upVec[i]) * k;
+      }
+    }
+    // HUD・タップ表示用の角度（センサーモードの描画には使わない）
+    const f = state.fVec;
+    const n = Math.hypot(f[0], f[1], f[2]) || 1;
+    state.alt = Math.asin(Math.max(-1, Math.min(1, f[2] / n))) / astro.D2R;
+    state.az = (Math.atan2(f[0], f[1]) / astro.D2R + 360) % 360;
   }
 
   draw(now);
@@ -655,13 +687,19 @@ function updateHud(now) {
   const dir = DIRS8[Math.round(((state.az % 360) + 360) % 360 / 45) % 8];
   gazeEl.textContent = `${dir} ${Math.round(state.az)}° ／ 高度 ${Math.round(state.alt)}°`;
   if (debugEl) {
-    const r = sensor.lastRaw, t = sensor.target;
+    const r = sensor.lastRaw, tv = sensor.targetVec;
     const f1 = x => (typeof x === "number" ? x.toFixed(1) : String(x));
+    let targetLine = "";
+    if (tv) {
+      const tAz = (Math.atan2(tv[0], tv[1]) / astro.D2R + 360) % 360;
+      const tAlt = Math.asin(Math.max(-1, Math.min(1, tv[2]))) / astro.D2R;
+      targetLine = `target az:${f1(tAz)} alt:${f1(tAlt)}\n`;
+    }
     debugEl.textContent =
       `mode:${state.mode} active:${sensor.active}\n` +
       (r ? `ev:${r.type} abs:${r.absolute}\nα:${f1(r.alpha)} β:${f1(r.beta)} γ:${f1(r.gamma)} hd:${f1(r.heading)}\n` : "ev:none\n") +
-      (t ? `target az:${f1(t.az)} alt:${f1(t.alt)} roll:${f1(t.roll)}\n` : "") +
-      `view az:${f1(state.az)} alt:${f1(state.alt)} roll:${f1(state.roll)}\n` +
+      targetLine +
+      `view az:${f1(state.az)} alt:${f1(state.alt)}\n` +
       `scr:${(screen.orientation && screen.orientation.angle) || 0}°`;
   }
 }
@@ -880,6 +918,10 @@ modeBtn.addEventListener("click", async () => {
   if (sensorStarting) return;
   if (state.mode === "sensor") {
     state.mode = "drag";
+    // 直前の視線を引き継ぎつつ、ドラッグ用の角度系にリセット
+    state.roll = 0;
+    state.alt = Math.min(89.9, state.alt);
+    state.fVec = null;
     applyMode();
     return;
   }
