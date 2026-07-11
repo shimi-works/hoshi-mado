@@ -152,12 +152,12 @@ body {
 <canvas id="sky"></canvas>
 
 <div id="topbar">
-  <div id="status" title="タップで設定を開く">
+  <div id="status" title="タップで設定を開く" role="button" tabindex="0" aria-label="設定を開く">
     <span id="locName">仙台</span><span class="dim" id="clock">--:--</span>
   </div>
   <div class="spacer"></div>
-  <button class="iconbtn" id="modeBtn" title="センサー/手動の切り替え">✋</button>
-  <button class="iconbtn" id="settingsBtn" title="設定">⚙</button>
+  <button class="iconbtn" id="modeBtn" title="センサー/手動の切り替え" aria-label="センサー/手動の切り替え">✋</button>
+  <button class="iconbtn" id="settingsBtn" title="設定" aria-label="設定">⚙</button>
 </div>
 
 <div id="gaze"></div>
@@ -321,7 +321,15 @@ function saveSettings() {
 function loadSettings() {
   try {
     const s = JSON.parse(localStorage.getItem(STORE_KEY));
-    if (s) Object.assign(state, s);
+    if (!s || typeof s !== "object") return;
+    // JSONとしては正しいが値が壊れている保存値を素通しすると
+    // fovDeg=NaN→投影全滅で真っ白画面になるため、型を検証してから取り込む
+    if (Number.isFinite(s.lat) && Number.isFinite(s.lon)) { state.lat = s.lat; state.lon = s.lon; }
+    if (typeof s.locationName === "string") state.locationName = s.locationName;
+    if (Number.isFinite(s.fovDeg)) state.fovDeg = s.fovDeg;
+    for (const k of ["showLines", "showNames", "showConstNames", "redMode", "onboarded"]) {
+      if (typeof s[k] === "boolean") state[k] = s[k];
+    }
   } catch (e) { /* 壊れた保存値は無視して既定値 */ }
 }
 
@@ -752,15 +760,21 @@ canvas.addEventListener("wheel", e => {
   setFov(state.fovDeg * (e.deltaY > 0 ? 1.08 : 0.93));
 }, { passive: false });
 
+let fovSaveTimer = 0;
 function setFov(v) {
   state.fovDeg = Math.max(25, Math.min(100, v));
   fovRange.value = state.fovDeg;
   fovVal.textContent = `${Math.round(state.fovDeg)}°`;
-  saveSettings();
+  // ピンチ/ホイール中は連続発火するので、localStorage書き込みはデバウンス
+  clearTimeout(fovSaveTimer);
+  fovSaveTimer = setTimeout(saveSettings, 300);
 }
 
 // ---- キーボード ----
 window.addEventListener("keydown", e => {
+  // 設定パネルのselect/range等のネイティブなキー操作を横取りしない
+  const focused = document.activeElement;
+  if (focused && (focused.tagName === "SELECT" || focused.tagName === "INPUT")) return;
   const step = state.fovDeg / 18;
   switch (e.key) {
     case "ArrowLeft": if (state.mode === "drag") state.az = (state.az - step + 360) % 360; break;
@@ -800,7 +814,11 @@ citySel.addEventListener("change", () => {
 });
 document.getElementById("geoBtn").addEventListener("click", requestGeo);
 document.getElementById("settingsBtn").addEventListener("click", () => settingsEl.classList.toggle("show"));
-document.getElementById("status").addEventListener("click", () => settingsEl.classList.toggle("show"));
+const statusEl = document.getElementById("status");
+statusEl.addEventListener("click", () => settingsEl.classList.toggle("show"));
+statusEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); settingsEl.classList.toggle("show"); }
+});
 function closeSettings() { settingsEl.classList.remove("show"); }
 
 function setLocation(lat, lon, name) {
@@ -839,23 +857,32 @@ fovRange.addEventListener("input", () => setFov(Number(fovRange.value)));
 
 // ---- モード切替 ----
 const modeBtn = document.getElementById("modeBtn");
+let sensorStarting = false; // 連打でstart()（許可ダイアログ・リスナー登録）が多重に走るのを防ぐ
 modeBtn.addEventListener("click", async () => {
+  if (sensorStarting) return;
   if (state.mode === "sensor") {
     state.mode = "drag";
     applyMode();
-  } else {
-    if (!sensor.active) {
+    return;
+  }
+  if (!sensor.active) {
+    sensorStarting = true;
+    try {
       toast("センサーを開始しています…");
       const ok = await sensor.start();
       if (!ok) { state.mode = "drag"; applyMode(); return; }
+    } finally {
+      sensorStarting = false;
     }
-    state.mode = "sensor";
-    applyMode();
   }
+  state.mode = "sensor";
+  applyMode();
 });
 function applyMode() {
   modeBtn.textContent = state.mode === "sensor" ? "📡" : "✋";
-  modeBtn.title = state.mode === "sensor" ? "センサー追従中（タップで手動へ）" : "手動モード（タップでセンサーへ）";
+  const label = state.mode === "sensor" ? "センサー追従中（タップで手動へ）" : "手動モード（タップでセンサーへ）";
+  modeBtn.title = label;
+  modeBtn.setAttribute("aria-label", label);
   toast(state.mode === "sensor" ? "スマホをかざす方向に空が動きます" : "ドラッグで空を見回せます");
 }
 
