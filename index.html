@@ -379,29 +379,47 @@ const sensor = {
       -cB * sG, sB, cB * cG,
     ];
   },
+  headingOffset: null, // iOS用: 相対フレーム→真北の回転補正（度）
   _onEvent(e) {
-    let alpha = e.alpha, beta = e.beta, gamma = e.gamma;
+    const alpha = e.alpha, beta = e.beta, gamma = e.gamma;
     this.lastRaw = { alpha, beta, gamma, heading: e.webkitCompassHeading, absolute: e.absolute, type: e.type };
     if (alpha == null || beta == null || gamma == null) return;
-    if (typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading)) {
-      // iOS: alphaは相対値なのでコンパス方位で置き換える（近似）
-      alpha = 360 - e.webkitCompassHeading;
-    } else if (e.absolute !== true && this.expectAbsolute) {
+    const hasHeading = typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading);
+    if (!hasHeading && e.absolute !== true && this.expectAbsolute) {
       return; // absoluteが必要なイベント種で相対値しか来ない場合は捨てる
     }
+    // 行列は常に生のα/β/γから作る（この三つ組は姿勢として常に連続）。
+    // iOSでαをコンパス値で毎フレーム置き換えると、上向き姿勢でオイラー角の
+    // 分解枝とコンパス値が同時に崩れて方位が横へ飛ぶ（B-004）
     const m = this._matrix(alpha, beta, gamma);
     // 端末背面(-z)が向く方向 = ユーザーがかざした方向
-    const v = [-m[2], -m[5], -m[8]];
+    let v = [-m[2], -m[5], -m[8]];
     // 画面の上方向（画面回転を補正して端末座標に直してから地上座標へ）
     const th = ((screen.orientation && screen.orientation.angle) || 0) * astro.D2R;
     const su = [-Math.sin(th), Math.cos(th), 0];
-    const yE = [
+    let yE = [
       m[0] * su[0] + m[1] * su[1],
       m[3] * su[0] + m[4] * su[1],
       m[6] * su[0] + m[7] * su[1],
     ];
-    // 角度(az/alt/roll)には分解しない。天頂付近で方位角が不定になり
-    // 「上を向くと一気に横へずれる」ため、ベクトルのままframe側で平滑化する
+    if (hasHeading) {
+      // iOS: 「真のα = 360 − compassHeading」が成り立つのは水平寄りの姿勢のみ。
+      // そこで求めた真北とのずれ（オフセット）を、上を向いている間は凍結して使う
+      const wrap180 = x => ((x % 360) + 540) % 360 - 180;
+      const cand = wrap180(360 - e.webkitCompassHeading - alpha);
+      if (this.headingOffset == null) {
+        this.headingOffset = cand;
+      } else if (v[2] < 0.7) { // かざし先の高度が45°未満のときだけ校正を更新
+        this.headingOffset = wrap180(this.headingOffset + wrap180(cand - this.headingOffset) * 0.05);
+      }
+      // 真の方位 = 相対方位 − δ（α増加は方位減少に対応するため符号が反転する）
+      const dR = -this.headingOffset * astro.D2R, cD = Math.cos(dR), sD = Math.sin(dR);
+      const rotZ = a => [a[0] * cD + a[1] * sD, -a[0] * sD + a[1] * cD, a[2]];
+      v = rotZ(v);
+      yE = rotZ(yE);
+    }
+    // 角度(az/alt/roll)には分解しない。天頂付近で方位角が不定になるため、
+    // ベクトルのままframe側で平滑化する（B-003）
     this.targetVec = v;
     this.targetUp = yE;
     this.hasReading = true;
