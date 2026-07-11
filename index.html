@@ -403,20 +403,33 @@ const sensor = {
       m[6] * su[0] + m[7] * su[1],
     ];
     if (hasHeading) {
-      // iOS: 「真のα = 360 − compassHeading」が成り立つのは水平寄りの姿勢のみ。
-      // そこで求めた真北とのずれ（オフセット）を、上を向いている間は凍結して使う
+      // iOS: コンパスは「背面方位の真値」としてδ（相対フレーム→真北）の校正だけに使う。
+      // δの入力に生αを使うと、端末直立時(β≈90°)にαがγと結合して±数十°揺れて校正が汚れるため、
+      // 揺れない行列由来の背面方位(azBackRel)とコンパスの差を使う（B-005）
       const wrap180 = x => ((x % 360) + 540) % 360 - 180;
-      const cand = wrap180(360 - e.webkitCompassHeading - alpha);
-      if (this.headingOffset == null) {
-        this.headingOffset = cand;
-      } else if (v[2] < 0.7) { // かざし先の高度が45°未満のときだけ校正を更新
-        this.headingOffset = wrap180(this.headingOffset + wrap180(cand - this.headingOffset) * 0.05);
+      const backH = Math.hypot(v[0], v[1]); // 背面方向の水平成分（=方位の信頼度）
+      if (backH > 0.7) { // かざし先の高度が45°未満のときだけ校正できる
+        const azBackRel = Math.atan2(v[0], v[1]) / astro.D2R;
+        const cand = wrap180(azBackRel - e.webkitCompassHeading);
+        // 速く見回している間はコンパスの追従遅れで差が汚れるため校正しない
+        const turnRate = this._lastAzBackRel == null ? 0 : Math.abs(wrap180(azBackRel - this._lastAzBackRel));
+        this._lastAzBackRel = azBackRel;
+        if (this.headingOffset == null) {
+          this.headingOffset = cand;
+        } else if (turnRate < 0.3) { // ≈18°/s未満。ほぼ静止時のみ校正
+          const err = wrap180(cand - this.headingOffset);
+          // 大きくずれている（初回校正が上向き姿勢だった等）ときは速めに収束させる
+          const k = Math.abs(err) > 25 ? 0.15 : 0.01;
+          this.headingOffset = wrap180(this.headingOffset + err * k);
+        }
       }
-      // 真の方位 = 相対方位 − δ（α増加は方位減少に対応するため符号が反転する）
-      const dR = -this.headingOffset * astro.D2R, cD = Math.cos(dR), sD = Math.sin(dR);
-      const rotZ = a => [a[0] * cD + a[1] * sD, -a[0] * sD + a[1] * cD, a[2]];
-      v = rotZ(v);
-      yE = rotZ(yE);
+      if (this.headingOffset != null) {
+        // 真の方位 = 相対方位 − δ
+        const dR = -this.headingOffset * astro.D2R, cD = Math.cos(dR), sD = Math.sin(dR);
+        const rotZ = a => [a[0] * cD + a[1] * sD, -a[0] * sD + a[1] * cD, a[2]];
+        v = rotZ(v);
+        yE = rotZ(yE);
+      }
     }
     // 角度(az/alt/roll)には分解しない。天頂付近で方位角が不定になるため、
     // ベクトルのままframe側で平滑化する（B-003）
