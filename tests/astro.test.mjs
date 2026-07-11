@@ -115,6 +115,22 @@ for (const [caseName, c] of Object.entries(REF)) {
     `got r=${camD.r} u=${camD.u}`);
 }
 
+// 2.7) 磁気偏角（国土地理院 磁気図2020.0年値の近似式・西偏が正）
+{
+  const cases = [
+    ["仙台", 38.268, 140.869, 8.2],
+    ["東京", 35.681, 139.767, 7.6],
+    ["札幌", 43.062, 141.354, 9.2],
+    ["那覇", 26.212, 127.679, 5.0],
+  ];
+  for (const [name, lat, lon, expected] of cases) {
+    const d = astro.magneticDeclination(lat, lon);
+    check(`declination ${name}`, Math.abs(d - expected) < 0.5, `got ${d.toFixed(2)}, expected ~${expected}`);
+  }
+  check("declination outside Japan", astro.magneticDeclination(40.7, -74.0) === 0,
+    `got ${astro.magneticDeclination(40.7, -74.0)}`);
+}
+
 // 3) データ整合性（埋め込みデータの健全性）
 {
   const dataSrc = extract("// ==DATA-START==", "// ==DATA-END==");

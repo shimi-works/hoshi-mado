@@ -71,7 +71,7 @@ body {
 
 /* ---- 情報カード ---- */
 #card {
-  position: fixed; left: 0; right: 0; bottom: 0;
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 11;
   background: var(--panel); border-top: 1px solid var(--panel-border);
   border-radius: 16px 16px 0 0; box-shadow: var(--card-shadow);
   padding: 16px 20px calc(20px + env(safe-area-inset-bottom));
@@ -182,6 +182,9 @@ body {
   <label class="row">赤いナイトモード <input type="checkbox" id="optRed"></label>
   <h3>視野角 <span id="fovVal"></span></h3>
   <input type="range" id="fovRange" min="25" max="100" step="1">
+  <h3>方位の微調整 <span id="trimVal"></span></h3>
+  <input type="range" id="trimRange" min="-15" max="15" step="0.5">
+  <div class="kbd" style="margin-top:4px">実際の方角と少しずれるとき用（コンパスの個体差）。磁気偏角は自動補正済み。</div>
   <h3>キーボード</h3>
   <div class="kbd">
     <b>←→↑↓</b>視線移動（手動モード）<br>
@@ -251,6 +254,14 @@ const astro = {
     const D2R = this.D2R;
     const alt = altDeg * D2R, az = azDeg * D2R;
     return [Math.cos(alt) * Math.sin(az), Math.cos(alt) * Math.cos(az), Math.sin(alt)];
+  },
+  // 磁気偏角（西偏を正、度）。国土地理院の磁気図2020.0年値の近似式（日本域のみ有効）。
+  // コンパスは磁北を指すため、真北基準の星空とはこの角度だけずれる
+  magneticDeclination(latDeg, lonDeg) {
+    if (latDeg < 20 || latDeg > 50 || lonDeg < 122 || lonDeg > 150) return 0;
+    const dp = latDeg - 37, dl = lonDeg - 138;
+    const minutes = 18.462 * dp - 7.726 * dl + 0.007 * dp * dp - 0.007 * dp * dl - 0.655 * dl * dl;
+    return 8 + (15.822 + minutes) / 60;
   },
 };
 
@@ -332,6 +343,7 @@ const state = {
   lat: 38.268, lon: 140.869, locationName: "仙台",
   showLines: true, showNames: true, showConstNames: true, redMode: false,
   fovDeg: 70,
+  azTrim: 0, // 方位の手動微調整（度、東回り正。コンパスの個体差用）
   mode: "drag",            // "drag" | "sensor"
   az: 180, alt: 30, roll: 0, // 視線（ドラッグモードの描画とHUD表示に使う）
   fVec: null, upVec: null,   // センサーモードの視線/画面上ベクトル（平滑化済み）
@@ -340,9 +352,9 @@ const state = {
 };
 
 function saveSettings() {
-  const { lat, lon, locationName, showLines, showNames, showConstNames, redMode, fovDeg, onboarded } = state;
+  const { lat, lon, locationName, showLines, showNames, showConstNames, redMode, fovDeg, azTrim, mode, onboarded } = state;
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify({ lat, lon, locationName, showLines, showNames, showConstNames, redMode, fovDeg, onboarded }));
+    localStorage.setItem(STORE_KEY, JSON.stringify({ lat, lon, locationName, showLines, showNames, showConstNames, redMode, fovDeg, azTrim, mode, onboarded }));
   } catch (e) { /* プライベートモード等では保存しない */ }
 }
 function loadSettings() {
@@ -354,6 +366,8 @@ function loadSettings() {
     if (Number.isFinite(s.lat) && Number.isFinite(s.lon)) { state.lat = s.lat; state.lon = s.lon; }
     if (typeof s.locationName === "string") state.locationName = s.locationName;
     if (Number.isFinite(s.fovDeg)) state.fovDeg = s.fovDeg;
+    if (Number.isFinite(s.azTrim)) state.azTrim = Math.max(-15, Math.min(15, s.azTrim));
+    if (s.mode === "sensor") state.wasSensorMode = true; // 復元は起動シーケンスで判断
     for (const k of ["showLines", "showNames", "showConstNames", "redMode", "onboarded"]) {
       if (typeof s[k] === "boolean") state[k] = s[k];
     }
@@ -365,7 +379,6 @@ function loadSettings() {
 const sensor = {
   active: false,
   hasReading: false,
-  target: null, // {az, alt, roll}
   _matrix(alphaDeg, betaDeg, gammaDeg) {
     // W3C DeviceOrientation仕様の回転行列（端末座標→地上座標 x=東,y=北,z=上）
     const D2R = astro.D2R;
@@ -383,7 +396,8 @@ const sensor = {
   _onEvent(e) {
     const alpha = e.alpha, beta = e.beta, gamma = e.gamma;
     this.lastRaw = { alpha, beta, gamma, heading: e.webkitCompassHeading, absolute: e.absolute, type: e.type };
-    if (alpha == null || beta == null || gamma == null) return;
+    // NaNも弾く（nullチェックだけだと磁気センサー一時ロスト時のNaNが平滑化を恒久汚染する）
+    if (!Number.isFinite(alpha) || !Number.isFinite(beta) || !Number.isFinite(gamma)) return;
     const hasHeading = typeof e.webkitCompassHeading === "number" && !isNaN(e.webkitCompassHeading);
     if (!hasHeading && e.absolute !== true && this.expectAbsolute) {
       return; // absoluteが必要なイベント種で相対値しか来ない場合は捨てる
@@ -425,11 +439,16 @@ const sensor = {
       }
       if (this.headingOffset != null) {
         // 真の方位 = 相対方位 − δ
-        const dR = -this.headingOffset * astro.D2R, cD = Math.cos(dR), sD = Math.sin(dR);
-        const rotZ = a => [a[0] * cD + a[1] * sD, -a[0] * sD + a[1] * cD, a[2]];
-        v = rotZ(v);
-        yE = rotZ(yE);
+        v = this._rotAz(v, -this.headingOffset);
+        yE = this._rotAz(yE, -this.headingOffset);
       }
+    }
+    // コンパス（iOS/Androidとも）は磁北基準なので、磁気偏角ぶん真北へ回す（B-006）。
+    // さらにコンパスの個体差用の手動微調整を加える
+    const azCorr = -astro.magneticDeclination(state.lat, state.lon) + state.azTrim;
+    if (azCorr) {
+      v = this._rotAz(v, azCorr);
+      yE = this._rotAz(yE, azCorr);
     }
     // 角度(az/alt/roll)には分解しない。天頂付近で方位角が不定になるため、
     // ベクトルのままframe側で平滑化する（B-003）
@@ -437,7 +456,13 @@ const sensor = {
     this.targetUp = yE;
     this.hasReading = true;
   },
+  // 方位角にdeg（東回り正）を足す回転
+  _rotAz(a, deg) {
+    const t = deg * astro.D2R, c = Math.cos(t), s = Math.sin(t);
+    return [a[0] * c + a[1] * s, -a[0] * s + a[1] * c, a[2]];
+  },
   async start() {
+    this.hasReading = false; // 再試行時に前回の読み値で成功扱いにしない
     if (location.protocol === "file:" || (location.protocol !== "https:" && !["localhost", "127.0.0.1"].includes(location.hostname))) {
       toast("センサーはHTTPSでのみ使えます。手動モードで表示します");
       return false;
@@ -674,9 +699,12 @@ function frame() {
   // 恒星時変化は遅いので座標計算は200ms間隔で十分（描画は毎フレーム）
   if (now - lastSkyCompute > 200) { computeSky(now); lastSkyCompute = now; }
 
-  if (state.mode === "sensor" && sensor.targetVec) {
+  if (state.mode === "sensor" && sensor.targetVec &&
+      Number.isFinite(sensor.targetVec[0] + sensor.targetVec[1] + sensor.targetVec[2] +
+                      sensor.targetUp[0] + sensor.targetUp[1] + sensor.targetUp[2])) {
     // 平滑化はベクトルのまま行う（角度だと天頂付近で方位が飛ぶ）
     const k = 0.25;
+    if (state.fVec && !Number.isFinite(state.fVec[0])) state.fVec = null; // NaN汚染からの自己回復
     if (!state.fVec) {
       state.fVec = sensor.targetVec.slice();
       state.upVec = sensor.targetUp.slice();
@@ -942,6 +970,17 @@ function applyOpts() {
 }
 fovRange.addEventListener("input", () => setFov(Number(fovRange.value)));
 
+const trimRange = document.getElementById("trimRange");
+const trimVal = document.getElementById("trimVal");
+function setAzTrim(v) {
+  state.azTrim = Math.max(-15, Math.min(15, Number(v) || 0));
+  trimRange.value = state.azTrim;
+  trimVal.textContent = `${state.azTrim > 0 ? "+" : ""}${state.azTrim}°`;
+  clearTimeout(fovSaveTimer);
+  fovSaveTimer = setTimeout(saveSettings, 300);
+}
+trimRange.addEventListener("input", () => setAzTrim(trimRange.value));
+
 // ---- モード切替 ----
 const modeBtn = document.getElementById("modeBtn");
 let sensorStarting = false; // 連打でstart()（許可ダイアログ・リスナー登録）が多重に走るのを防ぐ
@@ -950,10 +989,12 @@ modeBtn.addEventListener("click", async () => {
   if (state.mode === "sensor") {
     state.mode = "drag";
     // 直前の視線を引き継ぎつつ、ドラッグ用の角度系にリセット
+    // （orientationリスナーは維持する: センサーへ戻すとき即応させるため）
     state.roll = 0;
-    state.alt = Math.min(89.9, state.alt);
+    state.alt = Math.max(-30, Math.min(89.9, state.alt));
     state.fVec = null;
     applyMode();
+    saveSettings();
     return;
   }
   if (!sensor.active) {
@@ -968,6 +1009,7 @@ modeBtn.addEventListener("click", async () => {
   }
   state.mode = "sensor";
   applyMode();
+  saveSettings();
 });
 function applyMode() {
   modeBtn.textContent = state.mode === "sensor" ? "📡" : "✋";
@@ -1018,10 +1060,20 @@ optRed.checked = state.redMode;
 document.getElementById("locName").textContent = state.locationName;
 citySel.value = String(Math.max(0, CITIES.findIndex(c => c[0] === state.locationName)));
 setFov(state.fovDeg);
+setAzTrim(state.azTrim);
 if (state.onboarded) onboardEl.classList.add("hide");
 resize();
 computeSky(Date.now());
 frame();
+// 前回センサーモードだった場合の復元。iOSは許可にユーザー操作が必要なので案内だけ出す
+if (state.onboarded && state.wasSensorMode) {
+  if (typeof DeviceOrientationEvent !== "undefined" &&
+      typeof DeviceOrientationEvent.requestPermission === "function") {
+    toast("📡ボタンでセンサーを再開できます");
+  } else {
+    sensor.start().then(ok => { if (ok) { state.mode = "sensor"; applyMode(); } });
+  }
+}
 </script>
 </body>
 </html>
