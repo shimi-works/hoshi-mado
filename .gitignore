@@ -1,0 +1,4 @@
+# build_data.py が自動ダウンロード・生成するファイル（真実はindex.htmlに埋め込み済み）
+tools/hyg.csv
+tools/modern_index.json
+tools/data_generated.js
